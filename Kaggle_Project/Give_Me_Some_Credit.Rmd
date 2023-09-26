@@ -1,0 +1,293 @@
+---
+title: "To Credit Or Not To Credit: Random Forest Implementation For Credit Default Classification"
+author: "Brandon Kaplan", "Tesfa Asmara", "Arsh Chhabra", "Sam Sasaki"
+date: "2022-11-22"
+output: pdf_document
+---
+
+```{r}
+library(pgam)
+library(magrittr)
+library(ggplot2)
+```
+
+```{r}
+# set up environment variables
+
+readRenviron("~/.Renviron")
+GiveMeSomeCreditTrainingCSV <- Sys.getenv("GiveMeSomeCreditTrainingCSV")
+GiveMeSomeCreditTestCSV <- Sys.getenv("GiveMeSomeCreditTestCSV")
+
+
+set.seed(47)
+
+training_data <- read.csv(file = GiveMeSomeCreditTrainingCSV)
+
+test_data <- read.csv(file = GiveMeSomeCreditTestCSV)
+
+#clean var names
+
+library(tidyverse)
+training_data <- rename(training_data, "DefaultLikely" = "SeriousDlqin2yrs",
+                                                        "RUUL" = "RevolvingUtilizationOfUnsecuredLines",
+                                                        "Age" = "age", 
+                                                        "NumPastDue1" ="NumberOfTime30.59DaysPastDueNotWorse",
+                                                        "Income" = "MonthlyIncome",
+                                                        "NumCredit" = "NumberOfOpenCreditLinesAndLoans",
+                                                        "NumLate" = "NumberOfTimes90DaysLate",
+                                                        "NumRealEst" = "NumberRealEstateLoansOrLines",
+                                                        "NumPastDue2" = "NumberOfTime60.89DaysPastDueNotWorse",
+                                                        "NumDep" = "NumberOfDependents")
+
+```
+
+```{r}
+# turn predictor variable from numeric to factor
+
+training_data$DefaultLikely <- ifelse(test=training_data$DefaultLikely == 0, yes="No", no="Yes") #turns 0 and 1 into no and yes
+training_data$DefaultLikely <- as.factor(training_data$DefaultLikely)
+```
+
+
+```{r}
+# imputing N/A values: a random forest based imputation method to impute values into the missing cols
+
+library(randomForest)
+
+max_nodes<-1500
+
+missing1 <- which(is.na(training_data[,7])) #find where na is in Income col
+data.1 <- training_data[-missing1, c(3:11)] #data set without id num, output var , also not NumDep 
+fit1 <- randomForest(Income ~ ., data = data.1, maxnodes = max_nodes) #fit a RF
+training_data[missing1, 7] <- predict(fit1, training_data[missing1, (3:11)]) #fill in pred val
+
+missing2 <- which(is.na(training_data[,12])) #find where na is in NumDep col
+data.2 <- training_data[-missing2, (3:12)] #data set without id num, output var, and Income
+fit2 <- randomForest(NumDep ~ ., data=data.2, maxnodes = max_nodes) #fit a RF
+training_data[missing2, 12] <- predict(fit2, training_data[missing2, (3:12)]) #fill in pred val
+```
+
+```{r}
+# backfitting alg
+
+for(i in 1:4) {
+
+data.1 <- training_data[-missing1, c(3:12)] #data set without id num, output var, also not NumDep 
+fit1 <- randomForest(Income ~ ., data = data.1, maxnodes = max_nodes) #fit a RF
+training_data[missing1, 7] <- predict(fit1, training_data[missing1, (3:12)]) #fill in pred val
+
+
+data.2 <- training_data[-missing2, (3:12)] #data set without id num, output var, and Income
+fit2 <- randomForest(NumDep ~ ., data=data.2, maxnodes = max_nodes) #fit a RF
+training_data[missing2, 12] <- predict(fit2, training_data[missing2, (3:12)]) #fill in pred val  
+}
+```
+
+```{r}
+# turn int to num
+
+training_data$Age <- as.numeric(training_data$Age)
+training_data$NumPastDue1 <- as.numeric(training_data$NumPastDue1)
+training_data$NumCredit <- as.numeric(training_data$NumCredit)
+training_data$NumLate <- as.numeric(training_data$NumLate)
+training_data$NumRealEst <- as.numeric(training_data$NumRealEst)
+training_data$NumPastDue2 <- as.numeric(training_data$NumPastDue2)
+```
+
+
+```{r}
+# treating outliers
+
+library(stray)
+outliers_matrix <- find_HDoutliers(training_data[3:12]) #get outlier info
+out_scores <- as.vector(outliers_matrix$out_scores) #save outscores
+```
+
+```{r}
+# basis expansion
+  
+trng_data <- training_data #mask training_data just in case
+na_vals <- c()
+
+for(i in 1:nrow(trng_data)) {
+  count_na <- 0
+  if(is.element(i, missing1)){
+    count_na = count_na + 1
+  }
+  if(is.element(i, missing2)) {
+    count_na = count_na + 1
+  }
+  na_vals <- append(na_vals, count_na)
+}
+
+trng_data <- cbind(trng_data, out_scores, na_vals)
+
+
+# here instead of removing and imputing outliers we chose to factor in out_scores and na_vals as predicting variables
+```
+
+
+
+
+```{r}
+# tune RF using ranger
+
+library(ranger)
+library(tuneRanger)
+library(mlr)
+
+
+dl_task = makeClassifTask(data = trng_data[, 2:ncol(trng_data)], target = "DefaultLikely")
+measure_auc <- list(auc)
+learner_rngr = tuneRanger(dl_task, measure = measure_auc, iters = 100, num.trees = 1500)
+```
+
+```{r}
+# extract predictions to pass through ROC
+
+#predict_rngr <- predict(learner_rngr$model$learner.model, trng_data[, 2:ncol(trng_data)]) #prediction
+#prediction_prob <- predictions(predict_rngr)
+
+prediction_prob <- learner_rngr$model$learner.model$predictions #probability matrix
+# predictions <- c()
+# for (i in 1:nrow(prediction_prob)){
+#   if (prediction_prob[i, 1] <= 0.5){ #if predicted prob is <= 0.5 append 1 (Yes) 
+#     predictions[i] <- 1
+#   } else {
+#       predictions[i] <- 0 #otherwise assign 0 (No)
+#     }
+# }
+predictions <- learner_rngr$model$learner.model$predictions[,1]
+```
+
+```{r}
+# run ranger w/ tuned params
+
+best_mtry_rngr <- learner_rngr$recommended.pars$mtry
+best_nodesize_rngr <- learner_rngr$recommended.pars$min.node.size
+best_sample_fraction <- learner_rngr$recommended.pars$sample.fraction
+
+tuned_learner_rngr <- ranger(DefaultLikely ~ ., data = trng_data[, 2:ncol(trng_data)], num.trees = 1500, mtry = best_mtry_rngr, min.node.size = best_nodesize_rngr, sample.fraction = best_sample_fraction, probability = TRUE)
+```
+
+```{r}
+# plot ROC for ranger
+
+library(pROC)
+
+roc2 <- roc(response = trng_data$DefaultLikely, predictor = predictions, levels = c("No", "Yes"))
+plot(roc2)
+roc2
+oob_err <- learner_rngr$model$learner.model$prediction.error
+accuracy <- 1 - oob_err
+print(accuracy) #you can see how accuracy is quite high while our AUC is still low
+table(predictions, trng_data$DefaultLikely)
+```
+
+```{r}
+library(tidyverse)
+test_data <- rename(test_data, "DefaultLikely" = "SeriousDlqin2yrs",
+                                                        "RUUL" = "RevolvingUtilizationOfUnsecuredLines",
+                                                        "Age" = "age", 
+                                                        "NumPastDue1" ="NumberOfTime30.59DaysPastDueNotWorse",
+                                                        "Income" = "MonthlyIncome",
+                                                        "NumCredit" = "NumberOfOpenCreditLinesAndLoans",
+                                                        "NumLate" = "NumberOfTimes90DaysLate",
+                                                        "NumRealEst" = "NumberRealEstateLoansOrLines",
+                                                        "NumPastDue2" = "NumberOfTime60.89DaysPastDueNotWorse",
+                                                        "NumDep" = "NumberOfDependents")
+```
+
+```{r}
+library(randomForest)
+
+max_nodes<-1500
+
+missing1 <- which(is.na(test_data[,7])) #find where na... is in Income col
+data.1 <- test_data[-missing1, c(3:11)] #data set without id num, output var , also not NumDep 
+fit1 <- randomForest(Income ~ ., data = data.1, maxnodes = max_nodes) #fit a RF
+test_data[missing1, 7] <- predict(fit1, test_data[missing1, (3:11)]) #fill in pred val
+
+missing2 <- which(is.na(test_data[,12])) #find where na... is in NumDep col
+data.2 <- test_data[-missing2, (3:12)] #data set without id num, output var, and Income
+fit2 <- randomForest(NumDep ~ ., data=data.2, maxnodes = max_nodes) #fit a RF
+test_data[missing2, 12] <- predict(fit2, test_data[missing2, (3:12)]) #fill in pred val
+```
+
+```{r}
+# backfitting alg
+
+for(i in 1:4) {
+
+data.1 <- test_data[-missing1, c(3:12)] #data set without id num, output var , also not NumDep 
+fit1 <- randomForest(Income ~ ., data = data.1, maxnodes = max_nodes) #fit a RF
+test_data[missing1, 7] <- predict(fit1, test_data[missing1, (3:12)]) #fill in pred val
+
+
+data.2 <- test_data[-missing2, (3:12)] #data set without id num, output var, and Income
+fit2 <- randomForest(NumDep ~ ., data=data.2, maxnodes = max_nodes) #fit a RF
+test_data[missing2, 12] <- predict(fit2, test_data[missing2, (3:12)]) #fill in pred val  
+}
+```
+
+```{r}
+# turn int to num
+
+test_data$Age <- as.numeric(test_data$Age)
+test_data$NumPastDue1 <- as.numeric(test_data$NumPastDue1)
+test_data$NumCredit <- as.numeric(test_data$NumCredit)
+test_data$NumLate <- as.numeric(test_data$NumLate)
+test_data$NumRealEst <- as.numeric(test_data$NumRealEst)
+test_data$NumPastDue2 <- as.numeric(test_data$NumPastDue2)
+```
+
+
+```{r}
+# treating outliers
+
+library(stray)
+outliers_matrix <- find_HDoutliers(test_data[3:12]) #get outlier info
+out_scores <- as.vector(outliers_matrix$out_scores) #save outscores
+```
+
+```{r}
+# basis expansion
+  
+na_vals <- c()
+
+for(i in 1:nrow(test_data)) {
+  count_na <- 0
+  if(is.element(i, missing1)){
+    count_na = count_na + 1
+  }
+  if(is.element(i, missing2)) {
+    count_na = count_na + 1
+  }
+  na_vals <- append(na_vals, count_na)
+}
+
+test_data <- cbind(test_data, out_scores, na_vals)
+```
+
+```{r}
+# predict on test_data and create file output for kaggle
+
+library(ranger)
+library(tuneRanger)
+
+
+test_predictions <- predict(tuned_learner_rngr, data = test_data)$predictions
+
+predictions_final <- write.csv(test_predictions[, 2], file = "/Users/brandonkaplan/Pomona_OneDrive/compstat/Group_Project/test_predictions.csv", col.names = c("Id", "Probabilty"))
+
+
+```
+
+```{r}
+
+library(corrplot)
+correlations <- cor(trng_data[, 3:13])
+corrplot(correlations, method = "circle")
+
+```
+
